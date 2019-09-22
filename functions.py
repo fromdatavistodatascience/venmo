@@ -88,6 +88,131 @@ def get_transaction_specific_information(json_list_of_transactions):
     return transactions_df
 
 
+# Function to extract unique user data and store it into the venmo database
+
+def get_payer_information(json_list_of_transactions):
+    """Function that returns payer specific information from each transaction
+       and adds columns relating to user settings."""
+    # Identifying columns that contain null values
+    null_columns = (['email', 'friend_status', 'friends_count', 'identity',
+                     'phone', 'trust_request'])
+    payers = []
+    payer_ids = set()  # Set because I only want to retrieve unique ids
+    for transaction in json_list_of_transactions:
+        actor = transaction['payment']['actor']
+        actor_id = actor['id']
+        if actor_id in payer_ids:
+            continue
+        else:
+            payer_ids.add(actor_id)
+            payer = {}
+            for key, val in transaction['payment']['actor'].items():
+                if key in null_columns:
+                    continue
+                else:
+                    payer[key] = val
+            payers.append(payer.copy())
+
+    payers_df = pd.DataFrame(payers)
+    # Convert the date_joined objects into a datetime field
+    payers_df['date_joined'] = pd.to_datetime(payers_df['date_joined'],
+                                              format='%Y-%m-%dT%H:%M:%S')
+    # Drop the first and last name columns given that the same information is
+    # in the display_name column
+    payers_df.drop(['first_name', 'last_name'], axis=1, inplace=True)
+    # Create a column to determine if they have personalised the about column
+    # Values for default come after having explored the data in eda_venmo.ipynb
+    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
+                      'No Short Bio\n'])
+    about_personalised = ([0 if about in about_default else 1
+                           for about in payers_df['about']])
+    payers_df['about_personalised'] = about_personalised
+    # Create a column to determine if they have included a photo other than
+    # the default photo
+    pic_default = (['https://s3.amazonaws.com/venmo/no-image.gif',
+                'https://s3.amazonaws.com/venmo/placeholder-image/groups-placeholder.svg'])
+    pic_personalised = ([0 if about in pic_default else 1
+                         for about in payers_df['about']])
+    payers_df['pic_personalised'] = pic_personalised
+    # Note, there is a case where a user has no about, date_joined or username.
+    # They have, however, previously made a transaction so we will not drop.
+    return payers_df, payer_ids
+
+
+def get_payee_information(json_list_of_transactions):
+    """Function that returns payee specific information from each transaction
+       and adds columns relating to user settings."""
+    # Identifying columns that contain null values
+    null_columns = (['email', 'friend_status', 'friends_count', 'identity',
+                     'phone', 'trust_request'])
+
+    payees = []
+    payee_ids = set()  # Set because I only want to retrieve unique ids
+    counter = 0
+    # Some transactions are deemed as unsettled because they never reach the
+    # targeted payee. Hence, a try function has to be placed for now.
+    for transaction in json_list_of_transactions:
+        user = transaction['payment']['target']['user']
+        try:
+            user_id = user['id']
+        except TypeError:
+            counter += 1
+            continue
+        if user_id in payee_ids:
+            continue
+        else:
+            payee_ids.add(user_id)
+            payee = {}
+            for key, val in transaction['payment']['target']['user'].items():
+                if key in null_columns:
+                    continue
+                else:
+                    payee[key] = val
+            payees.append(payee.copy())
+    payees_df = pd.DataFrame(payees)
+    # Convert the date_joined objects into a datetime field
+    payees_df['date_joined'] = pd.to_datetime(payees_df['date_joined'],
+                                              format='%Y-%m-%dT%H:%M:%S')
+    # Drop the first and last name columns given that the same information is
+    # in display_name
+    payees_df.drop(['first_name', 'last_name'], axis=1, inplace=True)
+    # Create a column to determine if they have personalised the about column
+    # Values for default come after having explored the data in eda_venmo.ipynb
+    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
+                      'No Short Bio\n'])
+    about_personalised = ([0 if about in about_default else 1
+                           for about in payees_df['about']])
+    payees_df['about_personalised'] = about_personalised
+    # Create a column to determine if they have included a photo other than
+    # the default photo
+    pic_default = (['https://s3.amazonaws.com/venmo/no-image.gif',
+                    'https://s3.amazonaws.com/venmo/placeholder-image/groups-placeholder.svg'])
+    pic_personalised = ([0 if about in pic_default else 1
+                         for about in payees_df['about']])
+    payees_df['pic_personalised'] = pic_personalised
+    return payees_df, payee_ids
+
+
+def get_unique_user_table(json_list_of_transactions):
+    """Function that returns unique user information from the combination
+       of payer details and payee details."""
+    # Retrieve payer and payee details
+    payers_df, payer_ids = get_payer_information(json_list_of_transactions)
+    payees_df, payee_ids = get_payee_information(json_list_of_transactions)
+    # Identifying the payees that have not been payers for a complete user list
+    payees_not_payers = set()
+    for payee_id in payee_ids:
+        if payee_id not in payer_ids:
+            payees_not_payers.add(payee_id)
+    payees_not_payers_df = payees_df.loc[payees_df['id'].apply(
+        lambda x: x in payees_not_payers)]
+    # Concatenate the payees that have not been payers df to the payers df to
+    # generate the unique user table
+    unique_users = pd.concat([payers_df, payees_not_payers_df], axis=0)
+    unique_users = unique_users.rename(columns={"id": "user_id"})
+    return unique_users
+
+
 # Function to extract and store different apps into the venmo database
 
 def get_app_specific_information(json_list_of_transactions):

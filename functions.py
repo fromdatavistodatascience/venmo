@@ -8,6 +8,8 @@ import datetime
 import pickle
 
 
+# Functions to extract data from the Mongo DB database
+
 def collection():
     "Function that returns a collection from a MongoDB"
     # Instantiate a MongoClient and inspect the database names
@@ -31,6 +33,80 @@ def initial_5pct(collection):
     transactions = [transaction for transaction in cur]
     with open('initial_5pct_transactions.pkl', 'wb') as f:
         pickle.dump(transactions, f)
+
+
+# Function to extract and store transaction specific info into the venmo db
+
+def get_transaction_specific_information(json_list_of_transactions):
+    """Function that extracts transaction specific information and
+       stores each it in a table in the venmo transactions database."""
+    transactions = []
+    # Not including in _id because that is the object id from Venmo's db
+    keys = ['note', 'type', 'date_updated', 'id', 'date_created', 'audience']
+    subkeys = ['mentions', 'likes', 'comments', 'payment', 'app']
+    payment_keys = ['id', 'date_created']
+    app_key = ['id']
+    for details in json_list_of_transactions:
+        transaction = {}
+        for key, val in details.items():
+            if key in keys:
+                transaction[key] = val
+            # Subkeys 1 to 3 have the same subdictionary structure
+            elif key in subkeys[:2]:
+                for subkey, subval in val.items():
+                    unpacked = f'{key}_{subkey}'
+                    transaction[unpacked] = subval
+            # From the payments subkey we only extract the payment id and the
+            # date the payment was created (date_completed has null values)
+            elif key in subkeys[3]:
+                for subkey, subval in val.items():
+                    if subkey in payment_keys:
+                        unpacked = f'{key}_{subkey}'
+                        transaction[unpacked] = subval
+                    else:
+                        pass
+            # From the app subkey we only extract the id as this will be enough
+            # to link to the apps_details table in the db.
+            elif key in subkeys[4]:
+                app_id = f'{key}_id'
+                app_id_val = details[f'{key}']['id']
+                transaction[app_id] = app_id_val
+            else:
+                continue
+        transactions.append(transaction.copy())
+    # Transform the list of dictionaries into independent dataframes
+    transactions_df = pd.DataFrame(transactions)
+    # Rename col id to transaction_id for easier recognition in the db
+    transactions_df = transactions_df.rename(columns={"id": "transaction_id"})
+    # Converting the date_created and date_completed objects into a
+    # datetime.datetime field
+    transactions_df['payment_date_created'] = pd.to_datetime(
+        transactions_df['payment_date_created'], format='%Y-%m-%dT%H:%M:%S')
+    # For now, drop like and mentions information
+    drop = ['likes_count', 'likes_data', 'mentions_count', 'mentions_data']
+    transactions_df.drop(drop, axis=1, inplace=True)
+    return transactions_df
+
+
+# Function to extract and store different apps into the venmo database
+
+def get_app_specific_information(json_list_of_transactions):
+    """Function that extracts the application through which the venmo
+       transaction was made (ie iPhone app, desktop, etc) and stores
+       each type in a table in the venmo transactions database."""
+    apps = []
+    # Only extracting app information
+    app_subkeys = ['id', 'image_url', 'description', 'site_url', 'name']
+    for app_details in json_list_of_transactions:
+        app = {}
+        for key, val in app_details['app'].items():
+            app[key] = val
+        apps.append(app.copy())
+    apps_df = pd.DataFrame(apps)
+    # Dropping duplicates because there are only 8 different ways to
+    # make venmo payments
+    apps_df.drop_duplicates(inplace=True)
+    return apps_df
 
 
 # Functions to generate the relevant user statistics

@@ -270,8 +270,9 @@ def payed_transactions(username, password, train_window_end):
     cursor = extracting_cursor(username, password)
     q = f"""SELECT DISTINCT u.user_id, MAX(p1.diff_time) as max_time_diff_made_trans,
                    AVG(p1.diff_time) as mean_time_diff_made_trans,
-                   COUNT (DISTINCT p1.payment_id) as n_transactions_made
-            FROM (SELECT p.actor_id, p.payment_id,
+                   COUNT (DISTINCT p1.payment_id) as n_transactions_made,
+                   COUNT (DISTINCT p1.target_user_id) as n_trans_made_to_diff_users
+            FROM (SELECT p.actor_id, p.payment_id, p.target_user_id,
                          (LEAD(p.date_created, 1) OVER (PARTITION BY p.actor_id ORDER BY p.date_created)
                          - p.date_created) as diff_time
                   FROM payments p
@@ -290,8 +291,9 @@ def received_transactions(username, password, train_window_end):
     cursor = extracting_cursor(username, password)
     q = f"""SELECT DISTINCT u.user_id, MAX(p1.diff_time) as max_time_diff_received_trans,
                    AVG(p1.diff_time) as mean_time_diff_received_trans,
-                   COUNT (DISTINCT p1.payment_id) as n_transactions_received
-            FROM (SELECT p.target_user_id, p.payment_id,
+                   COUNT (DISTINCT p1.payment_id) as n_transactions_received,
+                   COUNT (DISTINCT p1.actor_id) as trans_rec_from_diff_users
+            FROM (SELECT p.target_user_id, p.payment_id, p.actor_id,
                          (LEAD(p.date_created, 1) OVER (PARTITION BY p.target_user_id ORDER BY p.date_created)
                          - p.date_created) as diff_time
                   FROM payments p
@@ -302,6 +304,38 @@ def received_transactions(username, password, train_window_end):
     received_transactions_df = pd.DataFrame(cursor.fetchall())
     received_transactions_df.columns = [x[0] for x in cursor.description]
     return received_transactions_df
+
+
+def transactions_made_weekdays(username, password, train_window_end):
+    """Function that calculates the number of transactions made during the week
+       for each user"""
+    cursor = extracting_cursor(username, password)
+    q = f"""SELECT u.user_id, COUNT (DISTINCT p.payment_id) as trans_made_week
+            FROM payments p
+            INNER JOIN users u ON u.user_id = p.actor_id
+            WHERE EXTRACT (DOW FROM p.date_created) NOT IN (0, 6)
+            AND p.date_created <= CAST('{train_window_end}' AS timestamp)
+            GROUP BY (u.user_id);"""
+    cursor.execute(q)
+    trans_made_week = pd.DataFrame(cursor.fetchall())
+    trans_made_week.columns = [x[0] for x in cursor.description]
+    return trans_made_week
+
+
+def transactions_made_weekends(username, password, train_window_end):
+    """Function that calculates the number of transactions made during the
+       weekend for each user"""
+    cursor = extracting_cursor(username, password)
+    q = f"""SELECT u.user_id, COUNT (DISTINCT p.payment_id) as trans_made_weeknd
+            FROM payments p
+            INNER JOIN users u ON u.user_id = p.actor_id
+            WHERE EXTRACT (DOW FROM p.date_created) IN (0, 6)
+            AND p.date_created <= CAST('{train_window_end}' AS timestamp)
+            GROUP BY (u.user_id);"""
+    cursor.execute(q)
+    trans_made_weeknd = pd.DataFrame(cursor.fetchall())
+    trans_made_weeknd.columns = [x[0] for x in cursor.description]
+    return trans_made_weeknd
 
 
 def transactions_made_previous_day(username, password, previous_day_start,
@@ -319,6 +353,38 @@ def transactions_made_previous_day(username, password, previous_day_start,
     trans_made_yest_df = pd.DataFrame(cursor.fetchall())
     trans_made_yest_df.columns = [x[0] for x in cursor.description]
     return trans_made_yest_df
+
+
+def transactions_rec_weekdays(username, password, train_window_end):
+    """Function that calculates the number of transactions received during the
+       week for each user"""
+    cursor = extracting_cursor(username, password)
+    q = f"""SELECT u.user_id, COUNT (DISTINCT p.payment_id) as trans_rec_week
+            FROM payments p
+            INNER JOIN users u ON u.user_id = p.target_user_id
+            WHERE EXTRACT (DOW FROM p.date_created) NOT IN (0, 6)
+            AND p.date_created <= CAST('{train_window_end}' AS timestamp)
+            GROUP BY (u.user_id);"""
+    cursor.execute(q)
+    trans_rec_week = pd.DataFrame(cursor.fetchall())
+    trans_rec_week.columns = [x[0] for x in cursor.description]
+    return trans_rec_week
+
+
+def transactions_rec_weekends(username, password, train_window_end):
+    """Function that calculates the number of transactions received during
+       the weekend for each user"""
+    cursor = extracting_cursor(username, password)
+    q = f"""SELECT u.user_id, COUNT (DISTINCT p.payment_id) as trans_rec_weeknd
+            FROM payments p
+            INNER JOIN users u ON u.user_id = p.target_user_id
+            WHERE EXTRACT (DOW FROM p.date_created) IN (0, 6)
+            AND p.date_created <= CAST('{train_window_end}' AS timestamp)
+            GROUP BY (u.user_id);"""
+    cursor.execute(q)
+    trans_rec_weeknd = pd.DataFrame(cursor.fetchall())
+    trans_rec_weeknd.columns = [x[0] for x in cursor.description]
+    return trans_rec_weeknd
 
 
 def transactions_rec_previous_day(username, password, previous_day_start,
@@ -346,11 +412,21 @@ def made(username, password, previous_day_start, train_window_end):
         transactions_made_previous_day(username, password, previous_day_start,
                                        train_window_end)
     )
+    transactions_made_weekdays_df = (
+        transactions_made_weekdays(username, password, train_window_end)
+    )
+    transactions_made_weekends_df = (
+        transactions_made_weekends(username, password, train_window_end)
+    )
     # Outer join because not everyone who has previously made a transaction
     # necessarily made one yesterday
-    trans_made = pd.merge(payed_transactions_df,
-                          transactions_made_previous_day_df,
-                          'outer', on='user_id')
+    payed_and_previous_day = pd.merge(payed_transactions_df,
+                                      transactions_made_previous_day_df,
+                                      'outer', on='user_id')
+    dow = pd.merge(transactions_made_weekdays_df,
+                   transactions_made_weekends_df, 'outer', on='user_id')
+    # Inner join because every user in either df would have made a transaction
+    trans_made = pd.merge(payed_and_previous_day, dow, 'inner', on='user_id')
     # Filling with 0s the null values that arise when users have made a
     # transaction but not yesterday
     trans_made.fillna(0, inplace=True)
@@ -365,11 +441,21 @@ def received(username, password, previous_day_start, train_window_end):
         transactions_rec_previous_day(username, password, previous_day_start,
                                       train_window_end)
     )
+    transactions_rec_weekdays_df = (
+        transactions_rec_weekdays(username, password, train_window_end)
+    )
+    transactions_rec_weekends_df = (
+        transactions_rec_weekends(username, password, train_window_end)
+    )
     # Outer join because not everyone who has previously received a transaction
     # necessarily received one yesterday
-    trans_rec = pd.merge(received_transactions_df,
-                         transactions_rec_previous_day_df,
-                         'outer', on='user_id')
+    rec_and_previous_day = pd.merge(received_transactions_df,
+                                    transactions_rec_previous_day_df,
+                                      'outer', on='user_id')
+    dow = pd.merge(transactions_rec_weekdays_df, transactions_rec_weekends_df,
+                   'outer', on='user_id')
+    # Inner join because every user in either df would have received a transaction
+    trans_rec = pd.merge(rec_and_previous_day, dow, 'inner', on='user_id')
     # Filling with 0s the null values that arise when users have received a
     # transaction but not yesterday
     trans_rec.fillna(0, inplace=True)

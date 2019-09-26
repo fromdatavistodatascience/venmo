@@ -88,6 +88,200 @@ def get_transaction_specific_information(json_list_of_transactions):
     return transactions_df
 
 
+# Function to extract payment data and store it into the venmo database
+
+def get_payment_info(json_list_of_transactions):
+    """Function that extracts payment specific information and identifies whether payers
+       have made settled, unsettled or both types of payments."""
+    payments = []
+    keys = (['note', 'action', 'status', 'date_created', 'id',
+             'merchant_split_purchase', 'audience', 'date_completed'])
+    subdictionary_keys = ['target', 'actor']
+    # Onle including the keys in the payment target subdictionary that contains values
+    target_keys = ['redeemable_target', 'type']
+    user_key = ['user']
+    actor_key = ['id']
+    settled_payer_id = set() # Contains the set of actor_ids that have settled payments
+    unsettled_payer_id = set() # Contains the set of actor_ids that have unsettled payments
+    for transaction in json_list_of_transactions:
+        payment = {}
+        payment_details = transaction['payment']
+        for key, val in payment_details.items():
+            if key in keys:
+                unpacked = f'{key}'
+                payment[unpacked] = val
+            elif key in subdictionary_keys:
+                for subkey, subval in val.items():
+                    if subkey in target_keys:
+                        subkey_unpacked = f'{key}_{subkey}'
+                        payment[subkey_unpacked] = subval
+                    elif subkey in user_key:
+                        subkey_unpacked = f'{key}_{subkey}_{actor_key[0]}'
+                        # Some transactions don't have end users and as such they are deemed
+                        # as pending or cancelled. However, these should not be dropped because 
+                        # the user still made a transaction.
+                        try:
+                            subkey_unpacked_val = transaction['payment'][f'{key}'][f'{subkey}'][f'{actor_key[0]}']
+                            payment[subkey_unpacked] = subkey_unpacked_val
+                            settled_payer_id.add(transaction['payment']['actor']['id'])
+                        except TypeError:
+                            # Identify payers who have pending or cancelled transactions
+                            unsettled_payer_id.add(transaction['payment']['actor']['id'])
+                    elif subkey in actor_key:
+                        subkey_unpacked = f'{key}_{subkey}'
+                        payment[subkey_unpacked] = subval
+                    else:
+                        pass
+            else:
+                pass
+        payments.append(payment.copy())
+    # Identify payers that made a settled transaction given that they had at least one unsettled transaction
+    settled_and_unsettled_payer_ids = [payer for payer in unsettled_payer_id if payer in settled_payer_id]
+    unsettled_payer_ids = [payer for payer in unsettled_payer_id if payer not in settled_payer_id]
+    # Turning the dictionary into a dataframe
+    payments_df = pd.DataFrame(payments)
+    payments_df['date_completed'] = pd.to_datetime(payments_df['date_completed'], format='%Y-%m-%dT%H:%M:%S')
+    payments_df['date_created'] = pd.to_datetime(payments_df['date_created'], format='%Y-%m-%dT%H:%M:%S')
+    # Rename col id to payment_id for easier recognition in the db
+    payments_df = payments_df.rename(columns = {"id": "payment_id"}) 
+    payments_df = payments_df.sort_values(['actor_id', 'date_created'])
+    return payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids
+
+
+def get_true_and_false_transactions_from_settled_transactions(json_list_of_transactions):
+    """Function that returns a set of successful and duplicated payment ids. Payments are deemed
+       as duplicates if a successful payments has happened within 10 minutes before
+       or after the unsuccessful transaction occured."""
+    payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids = get_payment_info(json_list_of_transactions)
+    duplicated_transaction_ids = set()
+    non_duplicated_transaction_ids = set()
+    for actor in settled_and_unsettled_payer_ids:
+        #Creating actor specific dataframes
+        settled_and_unsettled_trans_df = payments_df.loc[payments_df['actor_id'] == f'{actor}']
+        transaction_dates = [date for date in settled_and_unsettled_trans_df['date_created']]
+        #Separating the dates of created payments for each user
+        for i in range(len(transaction_dates)-1):
+            time_diff = transaction_dates[i+1] - transaction_dates[i]
+            time_diff = time_diff.total_seconds()
+            #If the payments are made within 10 minutes then identify those transactions
+            if time_diff < 600: #WHY 10 MINUTES THOUGH?
+                date_tuple = (transaction_dates[i], transaction_dates[i+1])
+                #Create a new dataframe for each user that contains transactions made within 10 minute of each other
+                transaction_within_10 = (
+                    settled_and_unsettled_trans_df.loc[settled_and_unsettled_trans_df['date_created'].isin(date_tuple)])
+                #Extract the status' of both transactions
+                for status in transaction_within_10['status']:
+                #If one of the status' is settled it means that the rest are duplicates
+                    if status != 'settled':
+                        duplicated_id = transaction_within_10.loc[transaction_within_10['status'] == status]['payment_id']
+                        for _id in duplicated_id:
+                            duplicated_transaction_ids.add(_id)
+            else:
+                date_tuple = (transaction_dates[i], transaction_dates[i+1])
+                #Create a new dataframe for each user that contains transactions made within 10 minute of each other
+                transaction_within_10 = (
+                    settled_and_unsettled_trans_df.loc[settled_and_unsettled_trans_df['date_created'].isin(date_tuple)])
+                #Extract the status' of both transactions
+                for status in transaction_within_10['status']:
+                #If one of the status' is settled it means that the rest are duplicates
+                    if status != 'settled':
+                        non_duplicated_id = transaction_within_10.loc[transaction_within_10['status'] == status]['payment_id']
+                        for _id in non_duplicated_id:
+                            non_duplicated_transaction_ids.add(_id)
+    return duplicated_transaction_ids, non_duplicated_transaction_ids
+
+
+def get_true_and_false_transactions_from_unsettled_transactions(json_list_of_transactions):
+    """Function that returns a set of duplicated payment ids from unsettled transactions. 
+       Payments are deemed as duplicates if another unsuccessfull payment has happened 
+       10 minutes before the unsuccessful transaction occured."""
+    payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids = get_payment_info(json_list_of_transactions) 
+    # Select the transactions which users with unsettled payments have made within 10 minutes of each other.
+    duplicated_unsettled_transaction_ids = set()
+    non_duplicated_unsettled_transaction_ids = set()
+    for actor in unsettled_payer_ids:
+        #Creating actor specific dataframes
+        unsettled_trans_df = payments_df.loc[payments_df['actor_id'] == f'{actor}']
+        #Separating the dates of created payments for each user
+        transaction_dates = [date for date in unsettled_trans_df['date_created']]
+        if len(transaction_dates) == 1:
+            tran_id = (
+                unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[0]]['payment_id'])
+            non_duplicated_unsettled_transaction_ids.add(tran_id.any())
+        else:
+            first_trans_date = None
+            for i in range(len(transaction_dates)-1):
+                time_diff = transaction_dates[i+1] - transaction_dates[i]
+                time_diff = time_diff.total_seconds()
+                #If the payments are made within 10 minutes then identify those transactions
+                if time_diff < 600: #WHY 10 MINUTES THOUGH?
+                    date_tuple = (transaction_dates[i], transaction_dates[i+1])
+                    trans_ids_for_date_tuple = (
+                        unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[i]]['payment_id'])
+                    if trans_ids_for_date_tuple.all() in duplicated_unsettled_transaction_ids:
+                        duplicated_trans_id = (
+                            unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[i+1]]['payment_id'])
+                        duplicated_unsettled_transaction_ids.add(duplicated_trans_id.any())
+                    else:
+                        first_trans_id = (
+                            unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[i]]['payment_id'])
+                        non_duplicated_unsettled_transaction_ids.add(first_trans_id.any())
+                        duplicated_trans_id = (
+                            unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[i+1]]['payment_id'])
+                        duplicated_unsettled_transaction_ids.add(duplicated_trans_id.any())
+                else:
+                    if transaction_dates[i+1] == transaction_dates[-1]:
+                        date_tuple = (transaction_dates[i], transaction_dates[i+1])
+                        non_duplicated_transaction_id = (
+                            unsettled_trans_df.loc[unsettled_trans_df['date_created'].isin(date_tuple)]['payment_id'])
+                        for _id in non_duplicated_transaction_id:
+                            non_duplicated_unsettled_transaction_ids.add(_id)
+                    else:
+                        non_duplicated_transaction_id = (
+                                unsettled_trans_df.loc[unsettled_trans_df['date_created'] == transaction_dates[i]]['payment_id'])
+                        non_duplicated_unsettled_transaction_ids.add(non_duplicated_transaction_id.any())
+    return duplicated_unsettled_transaction_ids, non_duplicated_unsettled_transaction_ids
+
+
+def diff_between_true_and_false_payments(json_list_of_transactions):
+    "Function that adds columns to differentiate between true and false payments"
+    duplicated_transaction_ids, non_duplicated_transaction_ids = (
+        get_true_and_false_transactions_from_settled_transactions(json_list_of_transactions)
+    )
+    duplicated_unsettled_transaction_ids, non_duplicated_unsettled_transaction_ids = (
+        get_true_and_false_transactions_from_unsettled_transactions(json_list_of_transactions))
+    payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids = (
+        get_payment_info(json_list_of_transactions))
+    settled_payment_ids = set(payments_df.loc[payments_df['status'] == 'settled']['payment_id'])
+    #Create new columns to identify between the two types of transactions
+    payments_df['true_transactions'] = ([1 if _id in settled_payment_ids else 1
+                                         if _id in non_duplicated_transaction_ids else 1
+                                         if _id in non_duplicated_unsettled_transaction_ids 
+                                         else 0 for _id in payments_df['payment_id']])
+    payments_df['false_transactions'] = ([1 if _id in duplicated_transaction_ids else 1
+                                          if _id in duplicated_unsettled_transaction_ids
+                                          else 0 for _id in payments_df['payment_id']])
+    return payments_df
+
+
+def get_payments_df_with_differentiated_payments(json_list_of_transactions):
+    """Function that perform final manipulation on the payments df prior to dumping
+       the data in the venmo database"""
+    payments_df = diff_between_true_and_false_payments(json_list_of_transactions)
+    # Unpack the merchant split type into two diff cols
+    payments_df = payments_df.drop('merchant_split_purchase', 1).assign(**payments_df['merchant_split_purchase']
+                                                                    .dropna().apply(pd.Series))
+    # Rename to miror the json structure
+    payments_df = payments_df.rename(columns={"authorization_id": "merchant_authorization_id"})
+    # Same process with the target_redeemable_target_col
+    payments_df = payments_df.drop('target_redeemable_target', 1).assign(**payments_df['target_redeemable_target']
+                                                                     .dropna().apply(pd.Series))
+    # Rename to miror the json structure
+    payments_df = payments_df.rename(columns = {"display_name": "target_redeemable_target_display_name",
+                                                "type": "target_redeemable_target_type"})
+    return payments_df
+
+
 # Function to extract unique user data and store it into the venmo database
 
 def get_payer_information(json_list_of_transactions):

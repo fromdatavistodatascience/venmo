@@ -21,18 +21,19 @@ def collection():
     return venmo
 
 
-def initial_5pct(collection):
+def initial_25pct(collection):
     """Function that returns a list of dictionaries with the initial 5% of
     transactions
     :input param - collection: MongoDB collection containing all transactions
     :ouput param - initial_10pct: returns initial 5% of transactions as a
     list of dictionaries
     """
-    _5pct = round(0.05 * (collection.count()))
-    cur = collection.find({})[:_5pct]
+    _25pct = round(0.25 * (collection.count()))
+    cur = collection.find({})[:_25pct]
     transactions = [transaction for transaction in cur]
-    with open('initial_5pct_transactions.pkl', 'wb') as f:
-        pickle.dump(transactions, f)
+    #  with open('initial_5pct_transactions.pkl', 'wb') as f:
+    #    pickle.dump(transactions, f)
+    return transactions
 
 
 # Function to extract and store transaction specific info into the venmo db
@@ -43,115 +44,73 @@ def get_transaction_specific_information(json_list_of_transactions):
     transactions = []
     # Not including in _id because that is the object id from Venmo's db
     keys = ['note', 'type', 'date_updated', 'id', 'date_created', 'audience']
-    subkeys = ['mentions', 'likes', 'comments', 'payment', 'app']
-    payment_keys = ['id', 'date_created']
-    app_key = ['id']
+    subkeys = ['mentions', 'likes', 'comments']
     for details in json_list_of_transactions:
         transaction = {}
-        for key, val in details.items():
-            if key in keys:
-                transaction[key] = val
-            # Subkeys 1 to 3 have the same subdictionary structure
-            elif key in subkeys[:2]:
-                for subkey, subval in val.items():
-                    unpacked = f'{key}_{subkey}'
-                    transaction[unpacked] = subval
-            # From the payments subkey we only extract the payment id and the
-            # date the payment was created (date_completed has null values)
-            elif key in subkeys[3]:
-                for subkey, subval in val.items():
-                    if subkey in payment_keys:
-                        unpacked = f'{key}_{subkey}'
-                        transaction[unpacked] = subval
-                    else:
-                        pass
-            # From the app subkey we only extract the id as this will be enough
-            # to link to the apps_details table in the db.
-            elif key in subkeys[4]:
-                app_id = f'{key}_id'
-                app_id_val = details[f'{key}']['id']
-                transaction[app_id] = app_id_val
+        for key in keys:
+            transaction[key] = details.get(key)
+        for key in subkeys:
+            transaction[f'{key}_count'] = details[key].get('count')
+            # Count determines if users interacted with transactions
+            if transaction[f'{key}_count'] > 0:
+                details[key].get('data')
+                transaction[f'{key}_data'] = []
+                # Getting the ids of users than interacted with transactions
+                for inter in details[f'{key}']['data']:
+                    try:
+                        transaction[f'{key}_data'].append(inter['user']['id'])
+                    except:
+                        transaction[f'{key}_data'].append(inter['id'])
             else:
-                continue
+                transaction[f'{key}_data'] = None
+        transaction['payment_id'] = details['payment'].get('id')
+        transaction['payment_actor_id'] = details['payment']['actor'].get('id')
+        # Rename col id to transaction_id for easier recognition in the db
+        transaction['transaction_id'] = transaction.pop('id')
         transactions.append(transaction.copy())
-    # Transform the list of dictionaries into independent dataframes
-    transactions_df = pd.DataFrame(transactions)
-    # Rename col id to transaction_id for easier recognition in the db
-    transactions_df = transactions_df.rename(columns={"id": "transaction_id"})
-    # Converting the date_created and date_completed objects into a
-    # datetime.datetime field
-    transactions_df['payment_date_created'] = pd.to_datetime(
-        transactions_df['payment_date_created'], format='%Y-%m-%dT%H:%M:%S')
-    # For now, drop like and mentions information
-    drop = ['likes_count', 'likes_data', 'mentions_count', 'mentions_data']
-    transactions_df.drop(drop, axis=1, inplace=True)
-    return transactions_df
+    return transactions
 
 
 # Function to extract payment data and store it into the venmo database
 
 def get_payment_info(json_list_of_transactions):
-    """Function that extracts payment specific information and identifies whether payers
-       have made settled, unsettled or both types of payments."""
+    """Function that extracts payment specific information and identifies
+       whether payers have made settled, unsettled or both types of payments."""
     payments = []
+    # Keys in the payment dictionary that have the same structure
     keys = (['note', 'action', 'status', 'date_created', 'id',
-             'merchant_split_purchase', 'audience', 'date_completed'])
-    subdictionary_keys = ['target', 'actor']
-    # Onle including the keys in the payment target subdictionary that contains values
-    target_keys = ['redeemable_target', 'type']
-    user_key = ['user']
-    actor_key = ['id']
-    settled_payer_id = set() # Contains the set of actor_ids that have settled payments
-    unsettled_payer_id = set() # Contains the set of actor_ids that have unsettled payments
+             'audience', 'date_completed'])
+    settled_payer_id = set()  # Set of actor_ids that have settled payments
+    unsettled_payer_id = set()  # Set of actor_ids that have unsettled payments
     for transaction in json_list_of_transactions:
         payment = {}
         payment_details = transaction['payment']
-        for key, val in payment_details.items():
-            if key in keys:
-                unpacked = f'{key}'
-                payment[unpacked] = val
-            elif key in subdictionary_keys:
-                for subkey, subval in val.items():
-                    if subkey in target_keys:
-                        subkey_unpacked = f'{key}_{subkey}'
-                        payment[subkey_unpacked] = subval
-                    elif subkey in user_key:
-                        subkey_unpacked = f'{key}_{subkey}_{actor_key[0]}'
-                        # Some transactions don't have end users and as such they are deemed
-                        # as pending or cancelled. However, these should not be dropped because 
-                        # the user still made a transaction.
-                        try:
-                            subkey_unpacked_val = transaction['payment'][f'{key}'][f'{subkey}'][f'{actor_key[0]}']
-                            payment[subkey_unpacked] = subkey_unpacked_val
-                            settled_payer_id.add(transaction['payment']['actor']['id'])
-                        except TypeError:
-                            # Identify payers who have pending or cancelled transactions
-                            unsettled_payer_id.add(transaction['payment']['actor']['id'])
-                    elif subkey in actor_key:
-                        subkey_unpacked = f'{key}_{subkey}'
-                        payment[subkey_unpacked] = subval
-                    else:
-                        pass
-            else:
-                pass
+        for key in keys:
+            payment[key] = payment_details.get(key)
+        payment['target_type'] = payment_details['target'].get('type')
+        try:
+            payment['target_user_id'] = payment_details['target']['user']['id']
+            settled_payer_id.add(transaction['payment']['actor']['id'])
+        except TypeError:
+            # Identify payers who have pending or cancelled transactions
+            unsettled_payer_id.add(transaction['payment']['actor']['id'])
+        payment['actor_id'] = payment_details['actor'].get('id')
+        # Rename col id to payment_id for easier recognition in the db
+        payment['payment_id'] = payment.pop('id')
+        # Transforming the date created col into datetime object
+        payment['date_created'] = datetime.datetime.strptime(
+            payment['date_created'], '%Y-%m-%dT%H:%M:%S')
         payments.append(payment.copy())
-    # Identify payers that made a settled transaction given that they had at least one unsettled transaction
-    settled_and_unsettled_payer_ids = [payer for payer in unsettled_payer_id if payer in settled_payer_id]
-    unsettled_payer_ids = [payer for payer in unsettled_payer_id if payer not in settled_payer_id]
-    # Turning the dictionary into a dataframe
-    payments_df = pd.DataFrame(payments)
-    payments_df['date_completed'] = pd.to_datetime(payments_df['date_completed'], format='%Y-%m-%dT%H:%M:%S')
-    payments_df['date_created'] = pd.to_datetime(payments_df['date_created'], format='%Y-%m-%dT%H:%M:%S')
-    # Rename col id to payment_id for easier recognition in the db
-    payments_df = payments_df.rename(columns = {"id": "payment_id"}) 
-    payments_df = payments_df.sort_values(['actor_id', 'date_created'])
-    return payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids
+    settled_and_unsettled_payer_ids = settled_payer_id.intersection(
+        unsettled_payer_id)
+    unsettled_payer_ids = unsettled_payer_id - settled_payer_id
+    return payments
 
 
 def get_true_and_false_transactions_from_settled_transactions(json_list_of_transactions):
-    """Function that returns a set of successful and duplicated payment ids. Payments are deemed
-       as duplicates if a successful payments has happened within 10 minutes before
-       or after the unsuccessful transaction occured."""
+    """Function that returns a set of successful and duplicated payment ids.
+       Payments are deemed as duplicates if a successful payments has happened
+       within 10 minutes before or after the unsuccessful transaction occured."""
     payments_df, settled_and_unsettled_payer_ids, unsettled_payer_ids = get_payment_info(json_list_of_transactions)
     duplicated_transaction_ids = set()
     non_duplicated_transaction_ids = set()
@@ -287,9 +246,13 @@ def get_payments_df_with_differentiated_payments(json_list_of_transactions):
 def get_payer_information(json_list_of_transactions):
     """Function that returns payer specific information from each transaction
        and adds columns relating to user settings."""
-    # Identifying columns that contain null values
-    null_columns = (['email', 'friend_status', 'friends_count', 'identity',
-                     'phone', 'trust_request'])
+    # Identifying columns that don't contain values.
+    # Not adding first or last name since they are present in display name
+    keys = (["username", "is_active", "display_name", "is_blocked", "about",
+             "profile_picture_url", "id", "date_joined", "is_group" ])
+    # Values for default come after having explored the data in eda_venmo.ipynb
+    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
+                      'No Short Bio\n'])
     payers = []
     payer_ids = set()  # Set because I only want to retrieve unique ids
     for transaction in json_list_of_transactions:
@@ -300,49 +263,36 @@ def get_payer_information(json_list_of_transactions):
         else:
             payer_ids.add(actor_id)
             payer = {}
-            for key, val in transaction['payment']['actor'].items():
-                if key in null_columns:
-                    continue
+            for key in keys:
+                # Determine if their about col is personalised
+                if key == 'about':
+                    about = actor.get(key)
+                    payer[key] = actor.get(key)
+                    if about in about_default:
+                        # Col to show if personalised about or not
+                        payer['about_personalised'] = 0
+                    else:
+                        payer['about_personalised'] = 1
                 else:
-                    payer[key] = val
+                    payer[key] = actor.get(key)
+            payer['user_id'] = payer.pop('id')
             payers.append(payer.copy())
-
-    payers_df = pd.DataFrame(payers)
-    # Convert the date_joined objects into a datetime field
-    payers_df['date_joined'] = pd.to_datetime(payers_df['date_joined'],
-                                              format='%Y-%m-%dT%H:%M:%S')
-    # Drop the first and last name columns given that the same information is
-    # in the display_name column
-    payers_df.drop(['first_name', 'last_name'], axis=1, inplace=True)
-    # Create a column to determine if they have personalised the about column
-    # Values for default come after having explored the data in eda_venmo.ipynb
-    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
-                      'No Short Bio\n'])
-    about_personalised = ([0 if about in about_default else 1
-                           for about in payers_df['about']])
-    payers_df['about_personalised'] = about_personalised
-    # Create a column to determine if they have included a photo other than
-    # the default photo
-    pic_default = (['https://s3.amazonaws.com/venmo/no-image.gif',
-                'https://s3.amazonaws.com/venmo/placeholder-image/groups-placeholder.svg'])
-    pic_personalised = ([0 if about in pic_default else 1
-                         for about in payers_df['about']])
-    payers_df['pic_personalised'] = pic_personalised
     # Note, there is a case where a user has no about, date_joined or username.
     # They have, however, previously made a transaction so we will not drop.
-    return payers_df, payer_ids
+    return payers, payer_ids
 
 
 def get_payee_information(json_list_of_transactions):
     """Function that returns payee specific information from each transaction
        and adds columns relating to user settings."""
     # Identifying columns that contain null values
-    null_columns = (['email', 'friend_status', 'friends_count', 'identity',
-                     'phone', 'trust_request'])
-
+    keys = (["username", "is_active", "display_name", "is_blocked", "about",
+             "profile_picture_url", "id", "date_joined", "is_group" ])
+    # Values for default come after having explored the data in eda_venmo.ipynb
+    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
+                      'No Short Bio\n'])
     payees = []
     payee_ids = set()  # Set because I only want to retrieve unique ids
-    counter = 0
     # Some transactions are deemed as unsettled because they never reach the
     # targeted payee. Hence, a try function has to be placed for now.
     for transaction in json_list_of_transactions:
@@ -350,61 +300,42 @@ def get_payee_information(json_list_of_transactions):
         try:
             user_id = user['id']
         except TypeError:
-            counter += 1
             continue
         if user_id in payee_ids:
             continue
         else:
             payee_ids.add(user_id)
             payee = {}
-            for key, val in transaction['payment']['target']['user'].items():
-                if key in null_columns:
-                    continue
+            for key in keys:
+                # Determine if their about col is personalised
+                if key == 'about':
+                    about = user.get(key)
+                    payee[key] = user.get(key)
+                    if about in about_default:
+                        # Col to show if personalised about or not
+                        payee['about_personalised'] = 0
+                    else:
+                        payee['about_personalised'] = 1
                 else:
-                    payee[key] = val
+                    payee[key] = user.get(key)
+            payee['user_id'] = payee.pop('id')
             payees.append(payee.copy())
-    payees_df = pd.DataFrame(payees)
-    # Convert the date_joined objects into a datetime field
-    payees_df['date_joined'] = pd.to_datetime(payees_df['date_joined'],
-                                              format='%Y-%m-%dT%H:%M:%S')
-    # Drop the first and last name columns given that the same information is
-    # in display_name
-    payees_df.drop(['first_name', 'last_name'], axis=1, inplace=True)
-    # Create a column to determine if they have personalised the about column
-    # Values for default come after having explored the data in eda_venmo.ipynb
-    about_default = ([' ', 'No Short Bio', 'No short bio', '\n', ' \n', '  ',
-                      'No Short Bio\n'])
-    about_personalised = ([0 if about in about_default else 1
-                           for about in payees_df['about']])
-    payees_df['about_personalised'] = about_personalised
-    # Create a column to determine if they have included a photo other than
-    # the default photo
-    pic_default = (['https://s3.amazonaws.com/venmo/no-image.gif',
-                    'https://s3.amazonaws.com/venmo/placeholder-image/groups-placeholder.svg'])
-    pic_personalised = ([0 if about in pic_default else 1
-                         for about in payees_df['about']])
-    payees_df['pic_personalised'] = pic_personalised
-    return payees_df, payee_ids
+    return payees, payee_ids
 
 
 def get_unique_user_table(json_list_of_transactions):
     """Function that returns unique user information from the combination
        of payer details and payee details."""
     # Retrieve payer and payee details
-    payers_df, payer_ids = get_payer_information(json_list_of_transactions)
-    payees_df, payee_ids = get_payee_information(json_list_of_transactions)
+    payers, payer_ids = get_payer_information(json_list_of_transactions)
+    payees, payee_ids = get_payee_information(json_list_of_transactions)
     # Identifying the payees that have not been payers for a complete user list
-    payees_not_payers = set()
-    for payee_id in payee_ids:
-        if payee_id not in payer_ids:
-            payees_not_payers.add(payee_id)
-    payees_not_payers_df = payees_df.loc[payees_df['id'].apply(
-        lambda x: x in payees_not_payers)]
-    # Concatenate the payees that have not been payers df to the payers df to
+    payee_ids.difference_update(payer_ids)
+    clean_payees = [payee for payee in payees if payee['user_id'] in payee_ids]
+    # Concatenate the payees that have not been payers to the payers to
     # generate the unique user table
-    unique_users = pd.concat([payers_df, payees_not_payers_df], axis=0)
-    unique_users = unique_users.rename(columns={"id": "user_id"})
-    return unique_users
+    payers.extend(clean_payees)
+    return payers
 
 
 # Function to extract and store different apps into the venmo database
@@ -416,16 +347,21 @@ def get_app_specific_information(json_list_of_transactions):
     apps = []
     # Only extracting app information
     app_subkeys = ['id', 'image_url', 'description', 'site_url', 'name']
-    for app_details in json_list_of_transactions:
-        app = {}
-        for key, val in app_details['app'].items():
-            app[key] = val
-        apps.append(app.copy())
-    apps_df = pd.DataFrame(apps)
-    # Dropping duplicates because there are only 8 different ways to
-    # make venmo payments
-    apps_df.drop_duplicates(inplace=True)
-    return apps_df
+    app_ids = set()
+    for app_detail in json_list_of_transactions:
+        app_details = app_detail['app']
+        app_id = app_details['id']
+        # There are only 8 diff types of apps, so by checking the id
+        # the process becomes much less computationally expensive
+        if app_id in app_ids:
+            continue
+        else:
+            app_ids.add(app_id)
+            app = {}
+            for key in app_details:
+                app[key] = app_details.get(key)
+            apps.append(app.copy())
+    return apps
 
 
 # Functions to generate the relevant user statistics
@@ -449,7 +385,8 @@ def user_info(username, password, train_window_end):
         account and whether or not they have a personalised bio."""
     cursor = extracting_cursor(username, password)
     q = f"""SELECT user_id, about_personalised as personalised_bio,
-            SUM(CAST('{train_window_end}' AS timestamp) - date_joined) as time_since_account_inception
+            SUM(CAST('{train_window_end}' AS timestamp) -
+            CAST(date_joined AS timestamp)) as time_since_account_inception
             FROM users
             GROUP BY (user_id, about_personalised);"""
     cursor.execute(q)

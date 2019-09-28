@@ -42,6 +42,7 @@ def get_transaction_specific_information(json_list_of_transactions):
     """Function that extracts transaction specific information and
        stores each it in a table in the venmo transactions database."""
     transactions = []
+    weird_transactions= []
     # Not including in _id because that is the object id from Venmo's db
     keys = ['note', 'type', 'date_updated', 'id', 'date_created', 'audience']
     subkeys = ['mentions', 'likes', 'comments']
@@ -63,12 +64,15 @@ def get_transaction_specific_information(json_list_of_transactions):
                         transaction[f'{key}_data'].append(inter['id'])
             else:
                 transaction[f'{key}_data'] = None
-        transaction['payment_id'] = details['payment'].get('id')
-        transaction['payment_actor_id'] = details['payment']['actor'].get('id')
+        try:
+            transaction['payment_id'] = details['payment'].get('id')
+            transaction['payment_actor_id'] = details['payment']['actor'].get('id')
+        except:
+            weird_transactions.append(transaction.copy())
         # Rename col id to transaction_id for easier recognition in the db
         transaction['transaction_id'] = transaction.pop('id')
         transactions.append(transaction.copy())
-    return transactions
+    return transactions, weird_transactions
 
 
 # Function to extract payment data and store it into the venmo database
@@ -83,27 +87,30 @@ def get_payment_info(json_list_of_transactions):
     settled_payer_id = set()  # Set of actor_ids that have settled payments
     unsettled_payer_id = set()  # Set of actor_ids that have unsettled payments
     for transaction in json_list_of_transactions:
-        payment = {}
-        payment_details = transaction['payment']
-        for key in keys:
-            payment[key] = payment_details.get(key)
-        payment['target_type'] = payment_details['target'].get('type')
-        try:
-            payment['target_user_id'] = payment_details['target']['user']['id']
-            settled_payer_id.add(transaction['payment']['actor']['id'])
-        except TypeError:
-            # Identify payers who have pending or cancelled transactions
-            unsettled_payer_id.add(transaction['payment']['actor']['id'])
-        payment['actor_id'] = payment_details['actor'].get('id')
-        # Rename col id to payment_id for easier recognition in the db
-        payment['payment_id'] = payment.pop('id')
-        # Transforming the date created col into datetime object
-        payment['date_created'] = datetime.datetime.strptime(
-            payment['date_created'], '%Y-%m-%dT%H:%M:%S')
-        payments.append(payment.copy())
-    settled_and_unsettled_payer_ids = settled_payer_id.intersection(
-        unsettled_payer_id)
-    unsettled_payer_ids = unsettled_payer_id - settled_payer_id
+        if transaction['id'] == '2541220786958500195':
+            continue
+        else:
+            payment = {}
+            payment_details = transaction['payment']
+            for key in keys:
+                payment[key] = payment_details.get(key)
+            payment['target_type'] = payment_details['target'].get('type')
+            try:
+                payment['target_user_id'] = payment_details['target']['user']['id']
+                settled_payer_id.add(transaction['payment']['actor']['id'])
+            except TypeError:
+                # Identify payers who have pending or cancelled transactions
+                unsettled_payer_id.add(transaction['payment']['actor']['id'])
+            payment['actor_id'] = payment_details['actor'].get('id')
+            # Rename col id to payment_id for easier recognition in the db
+            payment['payment_id'] = payment.pop('id')
+            # Transforming the date created col into datetime object
+            payment['date_created'] = datetime.datetime.strptime(
+                payment['date_created'], '%Y-%m-%dT%H:%M:%S')
+            payments.append(payment.copy())
+        #settled_and_unsettled_payer_ids = settled_payer_id.intersection(
+        #    unsettled_payer_id)
+        #unsettled_payer_ids = unsettled_payer_id - settled_payer_id
     return payments
 
 
@@ -256,27 +263,30 @@ def get_payer_information(json_list_of_transactions):
     payers = []
     payer_ids = set()  # Set because I only want to retrieve unique ids
     for transaction in json_list_of_transactions:
-        actor = transaction['payment']['actor']
-        actor_id = actor['id']
-        if actor_id in payer_ids:
+        if transaction['id'] == '2541220786958500195':
             continue
         else:
-            payer_ids.add(actor_id)
-            payer = {}
-            for key in keys:
-                # Determine if their about col is personalised
-                if key == 'about':
-                    about = actor.get(key)
-                    payer[key] = actor.get(key)
-                    if about in about_default:
-                        # Col to show if personalised about or not
-                        payer['about_personalised'] = 0
+            actor = transaction['payment']['actor']
+            actor_id = actor['id']
+            if actor_id in payer_ids:
+                continue
+            else:
+                payer_ids.add(actor_id)
+                payer = {}
+                for key in keys:
+                    # Determine if their about col is personalised
+                    if key == 'about':
+                        about = actor.get(key)
+                        payer[key] = actor.get(key)
+                        if about in about_default:
+                            # Col to show if personalised about or not
+                            payer['about_personalised'] = 0
+                        else:
+                            payer['about_personalised'] = 1
                     else:
-                        payer['about_personalised'] = 1
-                else:
-                    payer[key] = actor.get(key)
-            payer['user_id'] = payer.pop('id')
-            payers.append(payer.copy())
+                        payer[key] = actor.get(key)
+                payer['user_id'] = payer.pop('id')
+                payers.append(payer.copy())
     # Note, there is a case where a user has no about, date_joined or username.
     # They have, however, previously made a transaction so we will not drop.
     return payers, payer_ids
@@ -296,30 +306,33 @@ def get_payee_information(json_list_of_transactions):
     # Some transactions are deemed as unsettled because they never reach the
     # targeted payee. Hence, a try function has to be placed for now.
     for transaction in json_list_of_transactions:
-        user = transaction['payment']['target']['user']
-        try:
-            user_id = user['id']
-        except TypeError:
-            continue
-        if user_id in payee_ids:
+        if transaction['id'] == '2541220786958500195':
             continue
         else:
-            payee_ids.add(user_id)
-            payee = {}
-            for key in keys:
-                # Determine if their about col is personalised
-                if key == 'about':
-                    about = user.get(key)
-                    payee[key] = user.get(key)
-                    if about in about_default:
-                        # Col to show if personalised about or not
-                        payee['about_personalised'] = 0
+            user = transaction['payment']['target']['user']
+            try:
+                user_id = user['id']
+            except TypeError:
+                continue
+            if user_id in payee_ids:
+                continue
+            else:
+                payee_ids.add(user_id)
+                payee = {}
+                for key in keys:
+                    # Determine if their about col is personalised
+                    if key == 'about':
+                        about = user.get(key)
+                        payee[key] = user.get(key)
+                        if about in about_default:
+                            # Col to show if personalised about or not
+                            payee['about_personalised'] = 0
+                        else:
+                            payee['about_personalised'] = 1
                     else:
-                        payee['about_personalised'] = 1
-                else:
-                    payee[key] = user.get(key)
-            payee['user_id'] = payee.pop('id')
-            payees.append(payee.copy())
+                        payee[key] = user.get(key)
+                payee['user_id'] = payee.pop('id')
+                payees.append(payee.copy())
     return payees, payee_ids
 
 
@@ -384,10 +397,14 @@ def user_info(username, password, train_window_end):
     """ Function that returns the time period since the user opened the
         account and whether or not they have a personalised bio."""
     cursor = extracting_cursor(username, password)
-    q = f"""SELECT user_id, about_personalised as personalised_bio,
+    q = f"""SELECT u.user_id, u.about_personalised as personalised_bio,
             SUM(CAST('{train_window_end}' AS timestamp) -
-            CAST(date_joined AS timestamp)) as time_since_account_inception
-            FROM users
+            CAST(u.date_joined AS timestamp)) as time_since_account_inception,
+            COUNT(CASE WHEN p.status = 'settled'  THEN 1 END) as settled,
+            COUNT(CASE WHEN p.status = 'pending'  THEN 1 END) as pending,
+            COUNT(CASE WHEN p.status = 'cancelled'  THEN 1 END) as cancelled
+            FROM users u
+            INNER JOIN payments p ON p.actor_id=u.user_id
             GROUP BY (user_id, about_personalised);"""
     cursor.execute(q)
     user_info_df = pd.DataFrame(cursor.fetchall())
@@ -631,7 +648,8 @@ def extract_target(username, password, test_window_start, test_window_end):
     """Function that returns the target variable (whether someone made a
        transaction during a given time period) or not."""
     cursor = extracting_cursor(username, password)
-    q = f"""SELECT u.user_id, COUNT (DISTINCT p.payment_id) as n_transactions_made_29th
+    q = f"""SELECT u.user_id,
+            COUNT (DISTINCT p.payment_id) as n_trans_made_in_measured_period
             FROM payments p
             INNER JOIN users u ON u.user_id = p.actor_id
             WHERE p.date_created >= CAST('{test_window_start}' AS timestamp)
@@ -640,7 +658,7 @@ def extract_target(username, password, test_window_start, test_window_end):
     cursor.execute(q)
     tran_or_not_df = pd.DataFrame(cursor.fetchall())
     tran_or_not_df.columns = [x[0] for x in cursor.description]
-    tran_or_not_df['n_transactions_made_29th'] = (
-        [1 for trans in tran_or_not_df['n_transactions_made_29th']]
+    tran_or_not_df['n_trans_made_in_measured_period'] = (
+        [1 for trans in tran_or_not_df['n_trans_made_in_measured_period']]
     )
     return tran_or_not_df

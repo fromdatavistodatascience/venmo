@@ -662,3 +662,80 @@ def extract_target(username, password, test_window_start, test_window_end):
         [1 for trans in tran_or_not_df['n_trans_made_in_measured_period']]
     )
     return tran_or_not_df
+
+
+# Formulas for currency analysis
+
+def get_fx_rates(api_key, exchange_currency, desired_currency):
+    """Function that returns the 100 day FX rate history for the currency wished to
+    be exchanged in json format."""
+    url = 'https://www.alphavantage.co/query?'
+    function_input = 'FX_DAILY'
+    from_symbol_input = f'{exchange_currency}'
+    to_symbol_input = f'{desired_currency}'
+    url_params = (f"""function={function_input}&from_symbol={from_symbol_input}&to_symbol={to_symbol_input}&apikey={api_key}""")
+    request_url = url + url_params
+    response = requests.get(request_url)
+    return response
+
+
+def get_adjusted_rate(response_json):
+    "Function that converts json into pd dataframe with historic adj closed prices."
+    response_dict = {}
+    for key, val in response.json()['Time Series FX (Daily)'].items():
+        response_dict[key] = float(val['4. close'])
+    response_df = pd.DataFrame.from_dict(response_dict, 'index')
+    response_df.columns = ['Adj Close Price']
+    response_df = response_df.reindex(index=response_df.index[::-1])
+    return response_df
+
+
+def get_bollinger_bands(response_df):
+    """Function that returns the bollinger bands for the exchange rate in question."""
+    response_df['30 Day MA'] = response_df['Adj Close Price'].rolling(window=20).mean()
+    response_df['30 Day STD'] = response_df['Adj Close Price'].rolling(window=20).std()
+    response_df['Upper Band'] = response_df['30 Day MA'] + (response_df['30 Day STD'] * 2)
+    response_df['Lower Band'] = response_df['30 Day MA'] - (response_df['30 Day STD'] * 2)
+    return response_df
+
+
+def get_graphical_view(response_df, exchange_currency, desired_currency, today):
+    """Function that returns a graphic view of the exchange rate in question
+    and the corresponding bollinger bands."""
+    # We only want to show the previous month, therefore subset the dataframe
+    one_month_ago = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=today.day).strftime("%Y-%m-%d")
+    date_15_days_ago = (today - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+    response_df = response_df.loc[(response_df.index >= one_month_ago) & (response_df.index <= today.strftime("%Y-%m-%d"))]
+    
+    # set style, empty figure and axes
+    plt.style.use('fivethirtyeight')
+    fig = plt.figure(figsize=(12,6), facecolor='w')
+    ax = fig.add_subplot(111)
+    
+    # Get index values for the X axis for exchange rate DataFrame
+    x_axis = response_df.index
+    
+    # Plot shaded 21 Day Bollinger Band for exchange rate
+    ax.fill_between(x_axis, response_df['Upper Band'], response_df['Lower Band'], color='white')
+    
+    # Plot Adjust Closing Price and Moving Averages
+    ax.plot(x_axis, response_df['Adj Close Price'], color='blue', lw=2)
+    #ax.plot(x_axis, response_df['30 Day MA'], color='black', lw=2)
+    ax.plot(x_axis, response_df['Upper Band'], color='green', lw=2)
+    ax.plot(x_axis, response_df['Lower Band'], color='red', lw=2)
+    ax.set_xticks([one_month_ago, date_15_days_ago, today.strftime("%Y-%m-%d")])
+    
+    # Set Title & Show the Image
+    ax.set_title(f'30 Day Bollinger Band For {exchange_currency}/{desired_currency} rate')
+    ax.set_ylabel(f'Value of 1 {exchange_currency} in {desired_currency}')
+    ax.legend(['Adj Close Price', f'Strong {exchange_currency}', f'Weak {exchange_currency}'])
+    
+    # Compare the value of the exchange rate currencies
+    compare = response_bb_df.loc[response_bb_df.index == today.strftime("%Y-%m-%d")]
+    if compare['Adj Close Price'].values > compare['Upper Band'].values:
+        print(f'The {exchange_currency} is strong, consider making your international transaction today.')
+    elif compare['Adj Close Price'].values > compare['Lower Band'].values:
+        print(f"The {exchange_currency} is currently trading according to its boundaries.")
+    else:
+        print(f"The {exchange_currency} is weak, consider making your international transaction another day.")
+    return plt.show()

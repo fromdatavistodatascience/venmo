@@ -1004,3 +1004,5 @@ def get_cluster_topics_with_LDA(recomposed_note_stopped_em):
     for idx, topic in lda_model.print_topics():
         print('Topic: {} Word: {}'.format(idx, topic))
     return lda_model
+
+    

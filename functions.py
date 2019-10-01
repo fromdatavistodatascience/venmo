@@ -6,7 +6,23 @@ import pymongo
 import json
 import datetime
 import pickle
-
+import requests
+import matplotlib.pyplot as plt
+from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+import emoji
+import regex
+import nltk
+from nltk import FreqDist
+from nltk import word_tokenize
+from nltk.corpus import stopwords, wordnet
+import string
+from emoji.unicode_codes import UNICODE_EMOJI as ue
+from nltk.stem.wordnet import WordNetLemmatizer
+from nltk.cluster import cosine_distance
+from nltk.cluster.kmeans import KMeansClusterer
+import gensim
+from gensim.utils import simple_preprocess
+from gensim import corpora
 
 # Functions to extract data from the Mongo DB database
 
@@ -377,6 +393,197 @@ def get_app_specific_information(json_list_of_transactions):
     return apps
 
 
+# Functions to vectorize text for each user
+
+def extract_user_notes(username, password, train_window_end):
+    cursor = extracting_cursor(username, password)
+    q = f"""SELECT u.user_id, t.note
+            FROM transactions t
+            JOIN payments p USING (payment_id)
+            JOIN users u on u.user_id = p.actor_id
+            WHERE p.date_created <= CAST('{train_window_end}' AS timestamp)
+            ORDER BY u.user_id ASC;"""
+    cursor.execute(q)
+    user_notes = pd.DataFrame(cursor.fetchall())
+    user_notes.columns = [x[0] for x in cursor.description]
+    return user_notes
+
+
+def get_notes_into_unicode(notes):
+    """Function that takes in all the notes and returns the text as well as
+    the ejomis used in unicode."""
+    emoji_dict = {}
+    recomposed_note = []
+    for note in notes:
+        note_text = []
+        data = regex.findall(r'\X', note)
+        for word in data:
+            if any(char in emoji.UNICODE_EMOJI for char in word):
+                unicode_emoji = word.encode('unicode-escape').decode('ASCII')
+                emoji_dict[word] = unicode_emoji.lower()
+                note_text.append(unicode_emoji+' ')
+            else:
+                note_text.append(word)
+        recomposed_note.append(''.join(note_text))
+    return recomposed_note, emoji_dict
+
+
+def get_clean_text_pattern(recomposed_note):
+    """Function that filters through the notes, retrieves those that match
+     the specified pattern and removes stopwords."""
+    pattern = "([a-zA-Z0-9\\\]+(?:'[a-z]+)?)"
+    recomposed_note_raw = []
+    recomposed_note_raw = (
+        [nltk.regexp_tokenize(note, pattern) for note in recomposed_note])
+    # Create a list of stopwords and remove them from our corpus
+    stopwords_list = stopwords.words('english')
+    stopwords_list += list(string.punctuation)
+    # additional slang and informal versions of the original words had to be added to the corpus.
+    stopwords_list += (["im", "ur", "u", "'s", "n", "z", "n't", "brewskies", "mcd’s", "Ty$",
+                        "Diploooooo", "thx", "Clothessss", "K2", "B", "Comida", "yo", "jobby",
+                        "F", "jus", "bc", "queso", "fil", "Lol", "EZ", "RF", "기프트카드", "감사합니다",
+                        "Bts", "youuuu", "X’s", "bday", "WF", "Fooooood", "Yeeeeehaw", "temp",
+                        "af", "Chipoodle", "Hhuhhyhy", "Yummmmers", "MGE", "O", "Coook", "wahoooo",
+                        "Cuz", "y", "Cutz", "Lax", "LisBnB", "vamanos", "vroom", "Para", "el", "8==",
+                        "bitchhh", "¯\\_(ツ)_/¯", "Ily", "CURRYYYYYYY", "Depósito", "Yup", "Shhhhh"])
+
+    recomposed_note_stopped = (
+        [[w.lower() for w in note if w not in stopwords_list] for note in recomposed_note_raw])
+    return recomposed_note_stopped
+
+
+def get_wordnet_pos(word):
+    """Map POS tag to first character lemmatize() accepts"""
+    tag = nltk.pos_tag([word])[0][1][0].upper()
+    tag_dict = {"J": wordnet.ADJ,
+                "N": wordnet.NOUN,
+                "V": wordnet.VERB,
+                "R": wordnet.ADV}
+
+    return tag_dict.get(tag, wordnet.NOUN)
+
+
+def lemmatize_notes(recomposed_note_stopped):
+    "Function that lemmatizes the different notes."
+    # Init Lemmatizer
+    lemmatizer = WordNetLemmatizer()
+    lemmatized_notes = []
+    for sentence in recomposed_note_stopped:
+        # Notes have unicode to represent emojis and those can't be lemmatized
+        try:
+            for word in nltk.word_tokenize(sentence):
+                # Notes that combine emojis and text
+                try:
+                    lem = lemmatizer.lemmatize(word, get_wordnet_pos(word))
+                    lemmatized_notes.append(lem)
+                except:
+                    lemmatized_notes.append(word)
+        except:
+            lemmatized_notes.append(sentence)
+    return lemmatized_notes
+
+
+def turn_emoji_unicode_to_text(lemmatized_notes, emoji_dict):
+    "Function that converts unicode into emojis."
+    recomposed_note_stopped_em = []
+    for note in lemmatized_notes:
+        note_list = []
+        for word in note:
+            if word.startswith('\\'):
+                # Emoji dict represents a dict matching emojis and unicode.
+                for key, val in emoji_dict.items():
+                    if word == val:
+                        note_list.append(key)
+            else:
+                 note_list.append(word)
+        recomposed_note_stopped_em.append(note_list)
+    return recomposed_note_stopped_em
+
+
+def emojis_to_text(notes_list):
+    """Function that takes in all the notes and returns the emojis used
+    in the form of text captured by :colons:"""
+    recomposed_note = []
+    for notes in notes_list:
+        note_list = []
+        for note in notes:
+            note_text = []
+            data = regex.findall(r'\X', note)
+            for word in data:
+                if any(char in emoji.UNICODE_EMOJI for char in word):
+                    note_text.append(emoji.demojize(f'{word}'))
+                else:
+                    note_text.append(word)
+            note_list.append(''.join(note_text))
+        recomposed_note.append(note_list)
+    return recomposed_note
+
+
+def train_doc2vec_vectorizer(fully_recomposed_notes, whole_corpus_notes):
+    "Function that returns a trained doc2vec model for the whole note corpus."
+    # In order to train the Doc2Vec model all the words need to be in the same list
+    tagged_data = [TaggedDocument(words=w.split(' '), tags=[str(i)]) for i, w in enumerate(whole_corpus_notes)]
+    # Select model hyperparameters
+    max_epochs = 10
+    vec_size = 20
+    alpha = 0.025
+    min_alpha=0.00025
+    min_count=1
+    dm =1
+    # Input hyparameters into the model
+    vectorizer = Doc2Vec(size=vec_size, alpha=alpha, min_alpha=min_alpha,
+                     min_count=min_count, dm =dm)
+    # Build vocab of the notes with tagged data
+    vectorizer.build_vocab(tagged_data)
+    # Train the model for the range of epochs specified
+    for epoch in range(max_epochs):
+        print('iteration {0}'.format(epoch))
+        vectorizer.train(tagged_data,
+                    total_examples=vectorizer.corpus_count,
+                    epochs=vectorizer.iter)
+        # decrease the learning rate
+        vectorizer.alpha -= 0.0002
+        # fix the learning rate, no decay
+        vectorizer.min_alpha = vectorizer.alpha
+    # Save the model
+    vectorizer.save("d2v.model")
+
+
+def get_aggregated_user_note_vector(username, password, train_window_end):
+    "Function that turns the notes for each transaction into an n dimmensional vector."
+    
+    # Load functions to generate a list of fully composed notes
+    user_notes = extract_user_notes(username, password, train_window_end)
+    notes = user_notes['note']
+    recomposed_note, emoji_dict = get_notes_into_unicode(notes)
+    recomposed_note_stopped = get_clean_text_pattern(recomposed_note)
+    lemmatized_notes = lemmatize_notes(recomposed_note_stopped)
+    recomposed_note_stopped_em = turn_emoji_unicode_to_text(lemmatized_notes, emoji_dict)
+    fully_recomposed_notes = emojis_to_text(recomposed_note_stopped_em)
+    
+    # Combine the notes into a single corpus
+    whole_corpus_notes = [' '.join(note) for note in fully_recomposed_notes]
+    
+    # Load the model
+    vectorizer= Doc2Vec.load("d2v.model")
+    
+    # Find the vectors for each note in the whole note corpus
+    _vectrs = []
+    for note in whole_corpus_notes:
+        v = np.array(vectorizer.infer_vector(note))
+        _vectrs.append(v)
+    _vectrs_df = pd.DataFrame(_vectrs)
+    
+    # Each payment note vectorized for each user
+    user_notes.drop('note', axis=1, inplace=True)
+    user_vectrs_df = pd.concat([user_notes, _vectrs_df], axis=1)
+    
+    # Calculate the mean for users with multiple transactions (multiple notes)
+    user_vectrs_df = user_vectrs_df.groupby('user_id').mean()
+    
+    return user_vectrs_df
+
+
 # Functions to generate the relevant user statistics
 
 def get_keys(path):
@@ -629,6 +836,9 @@ def get_aggregated_user_statistics(username, password, previous_day_start,
     """Function that returns a dataframe with aggregated user statistics and
     personal user information statistics"""
     user_df = user_info(username, password, train_window_end)
+    user_vectrs_df = get_aggregated_user_note_vector(username, password, 
+                                                     train_window_end)
+    combined_user_info = pd.merge(user_df, user_vectrs_df, 'inner', on='user_id')
     trans_df = transactions(username, password, previous_day_start,
                             train_window_end)
     # Inner join because all users should have either made or received a
@@ -739,3 +949,58 @@ def get_graphical_view(response_df, exchange_currency, desired_currency, today):
     else:
         print(f"The {exchange_currency} is weak, consider making your international transaction another day.")
     return plt.show()
+
+
+# Functions to calculate clusters
+
+def get_distortion_plot(whole_corpus_notes):
+    "Function that retrieves the distortion measures for a range of k clusters."
+    # Calculate the vectors and store them in a list of arrays
+    _vectrs = []
+    for note in whole_corpus_notes:
+        v = np.array(vectorizer.infer_vector(note))
+        _vectrs.append(v)
+
+    # Calculate the distortion with the vector arrays
+    distortions = []
+    for k in range(1,10):
+        kclusterer = KMeansClusterer(k, distance=cosine_distance)
+        assigned_clusters = kclusterer.cluster(_vectrs, assign_clusters=True)
+
+        sum_of_squares = 0
+        current_cluster = 0
+        for centroid in kclusterer.means():
+            current_page = 0
+            for index_of_cluster_of_page in assigned_clusters:
+                if index_of_cluster_of_page == current_cluster:
+                    y = _vectrs[current_page]
+                    # Calculate SSE for different K
+                    sum_of_squares += np.sum((centroid - y) ** 2)
+                current_page += 1
+            current_cluster += 1
+        distortions.append(round(sum_of_squares))
+    
+    # Plot values of SSE
+    plt.figure(figsize=(15,8))
+    plt.subplot(121, title='Elbow curve')
+    plt.xlabel('k')
+    plt.plot(range(1, 10), distortions)
+    plt.grid(True)
+    return plt.show()
+
+
+def get_cluster_topics_with_LDA(recomposed_note_stopped_em):
+    "Function that calculates cluster topics for documents in a corpus."
+    # Retrieve the different documents
+    fully_recomposed_notes = emojis_to_text(recomposed_note_stopped_em)
+    # Create the Inputs of LDA model: Dictionary and Corpus
+    dct = corpora.Dictionary(fully_recomposed_notes)
+    corpus = [dct.doc2bow(note) for note in fully_recomposed_notes]
+    # Train the LDA model
+    lda_model = LdaMulticore(corpus=corpus, id2word=dct, random_state=100,
+                             num_topics=6, passes=10, chunksize=500,
+                             batch=False, offset=64, eval_every=0, iterations=100,
+                             gamma_threshold=0.001)
+    for idx, topic in lda_model.print_topics():
+        print('Topic: {} Word: {}'.format(idx, topic))
+    return lda_model

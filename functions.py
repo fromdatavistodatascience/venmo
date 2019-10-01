@@ -23,6 +23,7 @@ from nltk.cluster.kmeans import KMeansClusterer
 import gensim
 from gensim.utils import simple_preprocess
 from gensim import corpora
+import itertools
 
 # Functions to extract data from the Mongo DB database
 
@@ -619,6 +620,55 @@ def user_info(username, password, train_window_end):
     return user_info_df
 
 
+def get_user_interaction(username, password, train_window_end):
+    """Function that extract whether a user has interacted with the venmo
+       platform in the form of mentions, likes or comments."""
+    cursor = extracting_cursor(username, password)
+    # Extract the mentions, likes and comments data
+    q = f"""SELECT t.transaction_id, t.mentions_data,
+                   t.likes_data, t.comments_data
+            FROM transactions t
+            WHERE t.date_created <= CAST('{train_window_end}' AS timestamp);"""
+    cursor.execute(q)
+    interactions_data = pd.DataFrame(cursor.fetchall())
+    interactions_data.columns = [x[0] for x in cursor.description]
+    # Extract the ids in the different cols
+    mentions = (
+        [note[1:-1] for note in interactions_data['mentions_data'] if note is not None])
+    likes = (
+        [note[1:-1] for note in interactions_data['likes_data'] if note is not None])
+    comments = (
+        [note[1:-1] for note in interactions_data['comments_data'] if note is not None])
+    # Split and chain users in transactions with multiple interactors
+    mentions = [mention.split(',') for mention in mentions]
+    mentions = list(itertools.chain.from_iterable(mentions))
+    likes = [like.split(',') for like in likes]
+    likes = list(itertools.chain.from_iterable(likes))
+    comments = [comment.split(',') for comment in comments]
+    comments = list(itertools.chain.from_iterable(comments))
+    # Turn them into sets for easier manipulation
+    mentions_set = set(mention for mention in mentions)
+    likes_set = set(like for like in likes)
+    comments_set = set(comment for comment in comments)
+    # Select whole users in the db
+    q = f"""SELECT user_id
+        FROM users u;"""
+    cursor.execute(q)
+    users = pd.DataFrame(cursor.fetchall())
+    users.columns = [x[0] for x in cursor.description]
+    # Turn the ids into a set
+    user_set = set(user for user in users['user_id'])
+    # Find those users that have interacted
+    user_mentions = user_set.intersection(mentions_set)
+    user_likes = user_set.intersection(likes_set)
+    user_comments = user_set.intersection(comments_set)
+    # Create new binary cols for the different interactions in the user df
+    users['mentions'] = [1 if u in user_mentions else 0 for u in users['user_id']]  
+    users['likes'] = [1 if u in user_likes else 0 for u in users['user_id']] 
+    users['comments'] = [1 if u in user_comments else 0 for u in users['user_id']] 
+    return users
+
+
 def payed_transactions(username, password, train_window_end):
     """ Function that returns the total number of transactions made during a
         given period and the mean, max of the previous transactions made."""
@@ -836,14 +886,18 @@ def get_aggregated_user_statistics(username, password, previous_day_start,
     """Function that returns a dataframe with aggregated user statistics and
     personal user information statistics"""
     user_df = user_info(username, password, train_window_end)
+    user_interactios = get_user_interaction(username, password, train_window_end)
     user_vectrs_df = get_aggregated_user_note_vector(username, password, 
                                                      train_window_end)
-    combined_user_info = pd.merge(user_df, user_vectrs_df, 'inner', on='user_id')
+    user_info_and_inters = pd.merge(user_df, user_interactios, 'inner',
+                                    on='user_id')
+    combined_user_info = pd.merge(user_info_and_inters, user_vectrs_df,
+                                    'inner', on='user_id')
     trans_df = transactions(username, password, previous_day_start,
                             train_window_end)
     # Inner join because all users should have either made or received a
     # transaction, so they will have a user_id
-    agg_table = pd.merge(user_df, trans_df, 'inner', on='user_id')
+    agg_table = pd.merge(combined_user_info, trans_df, 'inner', on='user_id')
     time_delta_cols = (['time_since_account_inception',
                         'max_time_diff_made_trans',
                         'max_time_diff_received_trans',
@@ -1005,4 +1059,4 @@ def get_cluster_topics_with_LDA(recomposed_note_stopped_em):
         print('Topic: {} Word: {}'.format(idx, topic))
     return lda_model
 
-    
+# Add extra text for commit

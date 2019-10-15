@@ -520,9 +520,11 @@ def emojis_to_text(notes_list):
     return recomposed_note
 
 
-def train_doc2vec_vectorizer(fully_recomposed_notes, whole_corpus_notes):
+def train_doc2vec_vectorizer(fully_recomposed_notes):
     "Function that returns a trained doc2vec model for the whole note corpus."
     # In order to train the Doc2Vec model all the words need to be in the same list
+    # Combine the notes into a single corpus
+    whole_corpus_notes = [' '.join(note) for note in fully_recomposed_notes]
     tagged_data = [TaggedDocument(words=w.split(' '), tags=[str(i)]) for i, w in enumerate(whole_corpus_notes)]
     # Select model hyperparameters
     max_epochs = 10
@@ -548,6 +550,7 @@ def train_doc2vec_vectorizer(fully_recomposed_notes, whole_corpus_notes):
         vectorizer.min_alpha = vectorizer.alpha
     # Save the model
     vectorizer.save("d2v.model")
+    return tagged_data
 
 
 def get_aggregated_user_note_vector(username, password, train_window_end):
@@ -608,9 +611,7 @@ def user_info(username, password, train_window_end):
     q = f"""SELECT u.user_id, u.about_personalised as personalised_bio,
             SUM(CAST('{train_window_end}' AS timestamp) -
             CAST(u.date_joined AS timestamp)) as time_since_account_inception,
-            COUNT(CASE WHEN p.status = 'settled'  THEN 1 END) as settled,
-            COUNT(CASE WHEN p.status = 'pending'  THEN 1 END) as pending,
-            COUNT(CASE WHEN p.status = 'cancelled'  THEN 1 END) as cancelled
+            COUNT(CASE WHEN p.status = 'pending' OR  p.status = 'cancelled' THEN 1 END) as unsettled
             FROM users u
             INNER JOIN payments p ON p.actor_id=u.user_id
             GROUP BY (user_id, about_personalised);"""
@@ -946,7 +947,7 @@ def get_fx_rates(api_key, exchange_currency, desired_currency):
 def get_adjusted_rate(response_json):
     "Function that converts json into pd dataframe with historic adj closed prices."
     response_dict = {}
-    for key, val in response.json()['Time Series FX (Daily)'].items():
+    for key, val in response_json.json()['Time Series FX (Daily)'].items():
         response_dict[key] = float(val['4. close'])
     response_df = pd.DataFrame.from_dict(response_dict, 'index')
     response_df.columns = ['Adj Close Price']
@@ -995,13 +996,14 @@ def get_graphical_view(response_df, exchange_currency, desired_currency, today):
     ax.legend(['Adj Close Price', f'Strong {exchange_currency}', f'Weak {exchange_currency}'])
     
     # Compare the value of the exchange rate currencies
-    compare = response_bb_df.loc[response_bb_df.index == today.strftime("%Y-%m-%d")]
+    compare = response_df.loc[response_df.index == today.strftime("%Y-%m-%d")]
     if compare['Adj Close Price'].values > compare['Upper Band'].values:
         print(f'The {exchange_currency} is strong, consider making your international transaction today.')
     elif compare['Adj Close Price'].values > compare['Lower Band'].values:
         print(f"The {exchange_currency} is currently trading according to its boundaries.")
     else:
         print(f"The {exchange_currency} is weak, consider making your international transaction another day.")
+    plt.savefig("")
     return plt.show()
 
 
